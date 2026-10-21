@@ -28,9 +28,16 @@ The tweak does not change normal listings.
 
 The tweak uses only the Objective-C runtime. It does not need Substrate or ElleKit.
 
+## Download
+
+Get the dylib from the [latest release](https://github.com/adamsardo/MarketplaceAdBlock/releases/latest).
+
+- `MarketplaceAdBlock.dylib`: Use this file.
+- `MarketplaceAdBlock-debug.dylib`: This file also logs all query names and item types. Use it only for troubleshooting.
+
 ## Build
 
-You must have Xcode with the iOS SDK.
+You can build the dylib yourself. You must have Xcode with the iOS SDK.
 
 1. Run `./build.sh`.
 2. Get `MarketplaceAdBlock.dylib` from this folder.
@@ -53,7 +60,7 @@ To log all query names and item types, run `MPAB_LOG_ALL=1 ./build.sh`.
 
 If you see ads after a Facebook update, do these steps:
 
-1. Build with `MPAB_LOG_ALL=1`.
+1. Inject `MarketplaceAdBlock-debug.dylib`, or build with `MPAB_LOG_ALL=1`.
 2. Open Console.app on your Mac.
 3. Connect your device.
 4. Filter on `MPAdBlock`.
