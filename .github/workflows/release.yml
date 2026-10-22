@@ -13,6 +13,10 @@ on:
         description: 'Version to release, e.g. v1.1.0 (leave empty to only build)'
         required: false
         default: ''
+      ref:
+        description: 'Optional commit/branch to build instead of this one (published as a pre-release)'
+        required: false
+        default: ''
 
 permissions:
   contents: write
@@ -22,6 +26,8 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
 
       - name: Build release dylib
         run: |
@@ -44,6 +50,23 @@ jobs:
           fi
           strings dist/MarketplaceAdBlock-debug.dylib | grep -q 'item types'
 
+      - name: Diagnostics (load commands vs the upstream release)
+        continue-on-error: true
+        run: |
+          for f in dist/*.dylib; do
+            echo "=== $f"; otool -L "$f"; vtool -show-build "$f" | head -12
+            codesign -dv "$f" 2>&1 | head -6
+            otool -l "$f" | grep -E 'LC_DYLD_CHAINED|LC_DYLD_INFO|LC_ID_DYLIB' || true
+          done
+          if curl -fsSL -o upstream.dylib https://github.com/adamsardo/MarketplaceAdBlock/releases/latest/download/MarketplaceAdBlock.dylib; then
+            echo "=== upstream release dylib"; otool -L upstream.dylib; vtool -show-build upstream.dylib | head -12
+            codesign -dv upstream.dylib 2>&1 | head -6
+            otool -l upstream.dylib | grep -E 'LC_DYLD_CHAINED|LC_DYLD_INFO|LC_ID_DYLIB' || true
+          else
+            echo "upstream release dylib not downloadable"
+          fi
+          echo "built commit: $(git rev-parse HEAD)"
+
       - uses: actions/upload-artifact@v4
         with:
           name: dylibs
@@ -54,7 +77,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ inputs.tag || github.ref_name }}
+          PRE: ${{ inputs.ref != '' && '--prerelease' || '' }}
         run: |
-          # --target makes gh create the tag at this commit if it doesn't exist yet.
+          # --target makes gh create the tag at the built commit if it doesn't exist yet.
           gh release create "$TAG" dist/*.dylib \
-            --target "$GITHUB_SHA" --title "$TAG" --generate-notes
+            --target "$(git rev-parse HEAD)" --title "$TAG" --generate-notes $PRE
