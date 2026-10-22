@@ -50,6 +50,19 @@ To log all query names and item types, run `MPAB_LOG_ALL=1 ./build.sh`.
 2. Inject `MarketplaceAdBlock.dylib` into the IPA. Use a sideload tool, for example FlareStore.
 3. Install the IPA on your device.
 
+## Install as a jailbreak tweak (.deb)
+
+On a jailbroken device, you can install the tweak as a package instead. ElleKit or Substrate then loads it into the App Store Facebook app. You do not need to inject an IPA.
+
+You must have Xcode with the iOS SDK, `ldid`, and `dpkg`. On a Mac, run `brew install ldid dpkg`.
+
+1. Run `packaging/package.sh` for a rootless jailbreak, for example Dopamine or palera1n rootless. For a rootful jailbreak, run `packaging/package.sh rootful`.
+2. Get the `.deb` file from the `packages` folder.
+3. Install the `.deb` with Sileo, Zebra, or `dpkg -i`.
+4. Close Facebook and open it again.
+
+The script runs `build.sh` if `MarketplaceAdBlock.dylib` does not exist. To set the package version, add it after the scheme, for example `packaging/package.sh rootless 1.0.1`. The default version is the latest git tag.
+
 ## Tested with
 
 - Facebook iOS 584.0.0
