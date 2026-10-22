@@ -1,0 +1,53 @@
+name: Build and release
+
+# Builds the tweak dylibs on a macOS runner (Xcode + iOS SDK) and, for a
+# version tag like v1.1.0, publishes them as a GitHub release.
+# Run it by hand (Actions tab -> Run workflow) to just build and get the
+# dylibs as a downloadable artifact without releasing.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build release dylib
+        run: |
+          MPAB_LOG_ALL=0 ./build.sh
+          mkdir -p dist
+          cp MarketplaceAdBlock.dylib dist/MarketplaceAdBlock.dylib
+
+      - name: Build debug dylib
+        run: |
+          MPAB_LOG_ALL=1 ./build.sh
+          cp MarketplaceAdBlock.dylib dist/MarketplaceAdBlock-debug.dylib
+
+      - name: Check the builds
+        run: |
+          file dist/*.dylib
+          # The release dylib must not contain the debug-only log strings.
+          if strings dist/MarketplaceAdBlock.dylib | grep -qE 'item types|query %\{public\}@'; then
+            echo "release dylib looks like a debug build" >&2
+            exit 1
+          fi
+          strings dist/MarketplaceAdBlock-debug.dylib | grep -q 'item types'
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dylibs
+          path: dist/*.dylib
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/*.dylib \
+            --title "$GITHUB_REF_NAME" --generate-notes
