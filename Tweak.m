@@ -12,9 +12,17 @@
 // listing edges, so for Marketplace feed queries we also wrap the real handler,
 // buffer the response, and drop array items whose __typename is an ad type.
 //
+// The same response pass also does the listing-level features below (home feed
+// only, search results are left alone):
+//   - hide listings you have already seen
+//   - hide listings older than N hours
+//   - sort each page of listings newest first
+// And once per Marketplace visit we try to switch to the "Local" tab.
+//
 // Plain ObjC runtime swizzling, no Substrate/ElleKit dependency.
 
 #import <Foundation/Foundation.h>
+#import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <mach-o/dyld.h>
 #import <os/log.h>
@@ -25,11 +33,44 @@
 #define MPAB_LOG_ALL 0
 #endif
 
+// Feature defaults. Override at build time (see build.sh) or at runtime with the
+// NSUserDefaults keys named next to each one.
+#ifndef MPAB_HIDE_SEEN            // MPABHideSeen
+#define MPAB_HIDE_SEEN 1
+#endif
+#ifndef MPAB_SEEN_ON_IMPRESSION   // MPABSeenOnImpression: 1 = seen once delivered in a feed page, 0 = only once opened
+#define MPAB_SEEN_ON_IMPRESSION 1
+#endif
+#ifndef MPAB_MAX_AGE_HOURS        // MPABMaxAgeHours: 0 = no age filter
+#define MPAB_MAX_AGE_HOURS 168
+#endif
+#ifndef MPAB_SORT_NEWEST          // MPABSortNewest
+#define MPAB_SORT_NEWEST 1
+#endif
+#ifndef MPAB_DEFAULT_LOCAL_TAB    // MPABDefaultLocalTab
+#define MPAB_DEFAULT_LOCAL_TAB 1
+#endif
+#ifndef MPAB_LOCAL_TAB_LABEL      // MPABLocalTabLabel
+#define MPAB_LOCAL_TAB_LABEL "Local"
+#endif
+
 static os_log_t MPABLog(void) {
     static os_log_t log;
     static dispatch_once_t once;
     dispatch_once(&once, ^{ log = os_log_create("com.personal.mpadblock", "MPAdBlock"); });
     return log;
+}
+
+#pragma mark - Preferences
+
+static BOOL MPABPref(NSString *key, BOOL def) {
+    id v = [NSUserDefaults.standardUserDefaults objectForKey:key];
+    return v ? [v boolValue] : def;
+}
+
+static double MPABPrefNum(NSString *key, double def) {
+    id v = [NSUserDefaults.standardUserDefaults objectForKey:key];
+    return v ? [v doubleValue] : def;
 }
 
 #pragma mark - Matching
@@ -78,6 +119,23 @@ static NSString *MPABFriendlyName(NSURLRequest *request) {
     return value.stringByRemovingPercentEncoding ?: value;
 }
 
+// The GraphQL "variables" JSON of a form-encoded request, or nil.
+static NSDictionary *MPABRequestVariables(NSURLRequest *request) {
+    NSData *body = request.HTTPBody;
+    if (body.length == 0 || body.length > 512 * 1024) return nil;
+    NSString *str = [[NSString alloc] initWithData:body encoding:NSUTF8StringEncoding];
+    NSRange r = [str rangeOfString:@"variables="];
+    if (r.location == NSNotFound) return nil;
+    if (r.location > 0 && [str characterAtIndex:r.location - 1] != '&') return nil;
+    NSUInteger start = NSMaxRange(r);
+    NSRange end = [str rangeOfString:@"&" options:0 range:NSMakeRange(start, str.length - start)];
+    NSString *value = [str substringWithRange:NSMakeRange(start, (end.location == NSNotFound ? str.length : end.location) - start)];
+    value = [value stringByReplacingOccurrencesOfString:@"+" withString:@" "];
+    value = value.stringByRemovingPercentEncoding ?: value;
+    id json = [NSJSONSerialization JSONObjectWithData:[value dataUsingEncoding:NSUTF8StringEncoding] options:0 error:nil];
+    return [json isKindOfClass:[NSDictionary class]] ? json : nil;
+}
+
 #pragma mark - Failing request handler
 
 // Conforms informally to RCTURLRequestHandler / talks to RCTURLRequestDelegate.
@@ -117,6 +175,162 @@ static NSString *MPABFriendlyName(NSURLRequest *request) {
 
 @end
 
+#pragma mark - Seen store
+
+static NSString *const kMPABSeenKey = @"MPABSeenIDs";
+static const NSUInteger kMPABSeenCap = 20000;
+
+static NSMutableOrderedSet<NSString *> *MPABSeen(void) {
+    static NSMutableOrderedSet *set;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSArray *saved = [NSUserDefaults.standardUserDefaults arrayForKey:kMPABSeenKey];
+        set = saved ? [NSMutableOrderedSet orderedSetWithArray:saved] : [NSMutableOrderedSet orderedSet];
+    });
+    return set;
+}
+
+static void MPABScheduleSeenSave(void) {
+    static BOOL pending;
+    @synchronized (MPABSeen()) {
+        if (pending) return;
+        pending = YES;
+    }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC),
+                   dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        NSArray *snapshot;
+        @synchronized (MPABSeen()) {
+            pending = NO;
+            snapshot = [NSArray arrayWithArray:MPABSeen().array];
+        }
+        [NSUserDefaults.standardUserDefaults setObject:snapshot forKey:kMPABSeenKey];
+    });
+}
+
+static BOOL MPABIsSeen(NSString *lid) {
+    @synchronized (MPABSeen()) { return [MPABSeen() containsObject:lid]; }
+}
+
+static void MPABMarkSeen(NSString *lid) {
+    if (lid.length == 0) return;
+    @synchronized (MPABSeen()) {
+        NSMutableOrderedSet *set = MPABSeen();
+        [set removeObject:lid];   // re-add at the end so the cap evicts the oldest
+        [set addObject:lid];
+        if (set.count > kMPABSeenCap) [set removeObjectsInRange:NSMakeRange(0, set.count - kMPABSeenCap)];
+    }
+    MPABScheduleSeenSave();
+}
+
+#pragma mark - Listing helpers
+
+static BOOL MPABIsDict(id o) { return [o isKindOfClass:[NSDictionary class]]; }
+
+// The dictionary holding a listing's own fields (id, creation time, ...) for a
+// feed edge, or nil if the item isn't a listing. Feed edges look like
+// {node: {__typename: "MarketplaceFeedListingStoryObject", listing: {id, ...}}}.
+static NSDictionary *MPABListingDict(id item) {
+    if (!MPABIsDict(item)) return nil;
+    NSDictionary *node = MPABIsDict(item[@"node"]) ? item[@"node"] : nil;
+    NSArray *cands = node ? @[item, node] : @[item];
+    for (NSDictionary *c in cands) {
+        NSDictionary *l = MPABIsDict(c[@"listing"]) ? c[@"listing"] : nil;
+        if (l && l[@"id"]) return l;
+    }
+    // Some feeds put the listing fields straight on the node.
+    for (NSDictionary *c in cands) {
+        NSString *t = c[@"__typename"];
+        if ([t isKindOfClass:[NSString class]] &&
+            ([t containsString:@"Listing"] || [t containsString:@"ProductItem"]) && c[@"id"]) return c;
+    }
+    return nil;
+}
+
+static NSString *MPABListingID(NSDictionary *listing) {
+    id v = listing[@"id"];
+    if ([v isKindOfClass:[NSString class]]) return v;
+    if ([v isKindOfClass:[NSNumber class]]) return [v stringValue];
+    return nil;
+}
+
+// Seconds since epoch, or 0 if the listing carries no usable time.
+static NSTimeInterval MPABListingTime(NSDictionary *listing) {
+    for (NSString *key in @[@"creation_time", @"creationTime", @"listing_creation_time",
+                            @"created_time", @"creation_timestamp"]) {
+        id v = listing[key];
+        if (![v isKindOfClass:[NSNumber class]] && ![v isKindOfClass:[NSString class]]) continue;
+        double d = [v doubleValue];
+        if (d > 1e11) d /= 1000.0;   // milliseconds
+        if (d > 1e9) return d;       // anything earlier is not a plausible timestamp
+    }
+    return 0;
+}
+
+typedef struct {
+    BOOL hideSeen, markSeen, sortNewest;
+    NSTimeInterval maxAgeSec;       // 0 = off
+    NSUInteger ads, seen, old, reordered, listings, timed;
+} MPABCtx;
+
+static NSUInteger MPABCtxChanges(const MPABCtx *c) { return c->ads + c->seen + c->old + c->reordered; }
+
+// Hide seen/old listings, remember what was shown, and sort newest first.
+// Sorting only moves timed listings among their own slots, so a listing with no
+// timestamp keeps its position and nothing is ever dropped for lacking one.
+static void MPABProcessListings(NSMutableArray *arr, MPABCtx *ctx) {
+    if (!(ctx->hideSeen || ctx->markSeen || ctx->sortNewest || ctx->maxAgeSec > 0)) return;
+
+    BOOL hasListing = NO;
+    for (id item in arr) { if (MPABListingDict(item)) { hasListing = YES; break; } }
+    if (!hasListing) return;
+
+    NSTimeInterval now = [NSDate date].timeIntervalSince1970;
+    NSMutableArray<NSString *> *survivors = [NSMutableArray array];
+
+    for (NSInteger i = (NSInteger)arr.count - 1; i >= 0; i--) {
+        NSDictionary *listing = MPABListingDict(arr[i]);
+        if (!listing) continue;
+        ctx->listings++;
+        NSTimeInterval t = MPABListingTime(listing);
+        if (t > 0) ctx->timed++;
+        NSString *lid = MPABListingID(listing);
+        if (ctx->hideSeen && lid && MPABIsSeen(lid)) {
+            [arr removeObjectAtIndex:i];
+            ctx->seen++;
+            continue;
+        }
+        if (ctx->maxAgeSec > 0 && t > 0 && now - t > ctx->maxAgeSec) {
+            [arr removeObjectAtIndex:i];
+            ctx->old++;
+            continue;
+        }
+        if (lid) [survivors addObject:lid];
+    }
+    // Mark after the filtering pass so a duplicate inside one page isn't hidden.
+    if (ctx->markSeen) for (NSString *lid in survivors) MPABMarkSeen(lid);
+
+    if (ctx->sortNewest) {
+        NSMutableArray<NSNumber *> *slots = [NSMutableArray array];
+        NSMutableArray *timed = [NSMutableArray array];
+        for (NSUInteger i = 0; i < arr.count; i++) {
+            NSDictionary *listing = MPABListingDict(arr[i]);
+            if (listing && MPABListingTime(listing) > 0) { [slots addObject:@(i)]; [timed addObject:arr[i]]; }
+        }
+        if (timed.count >= 2) {
+            NSArray *sorted = [timed sortedArrayWithOptions:NSSortStable
+                                            usingComparator:^NSComparisonResult(id a, id b) {
+                NSTimeInterval ta = MPABListingTime(MPABListingDict(a));
+                NSTimeInterval tb = MPABListingTime(MPABListingDict(b));
+                return ta > tb ? NSOrderedAscending : (ta < tb ? NSOrderedDescending : NSOrderedSame);
+            }];
+            for (NSUInteger k = 0; k < slots.count; k++) {
+                NSUInteger idx = slots[k].unsignedIntegerValue;
+                if (arr[idx] != sorted[k]) { arr[idx] = sorted[k]; ctx->reordered++; }
+            }
+        }
+    }
+}
+
 #pragma mark - Response filtering
 
 // Marketplace feed queries whose responses may contain blended ad stories.
@@ -154,8 +368,7 @@ static NSString *MPABAdTypenameOfItem(id item) {
     return nil;
 }
 
-static NSUInteger MPABStrip(id obj, NSMutableSet<NSString *> *seenTypes) {
-    NSUInteger removed = 0;
+static void MPABStrip(id obj, NSMutableSet<NSString *> *seenTypes, MPABCtx *ctx) {
     if ([obj isKindOfClass:[NSMutableArray class]]) {
         NSMutableArray *arr = obj;
         for (NSInteger i = (NSInteger)arr.count - 1; i >= 0; i--) {
@@ -167,15 +380,15 @@ static NSUInteger MPABStrip(id obj, NSMutableSet<NSString *> *seenTypes) {
             NSString *adType = MPABAdTypenameOfItem(item);
             if (adType) {
                 [arr removeObjectAtIndex:i];
-                removed++;
+                ctx->ads++;
             } else {
-                removed += MPABStrip(item, seenTypes);
+                MPABStrip(item, seenTypes, ctx);
             }
         }
+        MPABProcessListings(arr, ctx);
     } else if ([obj isKindOfClass:[NSMutableDictionary class]]) {
-        for (id value in [obj allValues]) removed += MPABStrip(value, seenTypes);
+        for (id value in [obj allValues]) MPABStrip(value, seenTypes, ctx);
     }
-    return removed;
 }
 
 // Returns filtered data, or the original if nothing changed or it isn't JSON.
@@ -185,11 +398,18 @@ static NSData *MPABFilterResponse(NSData *data, NSString *name) {
     NSString *body = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
     if (!body) return data;
 
+    // Listing features are for the home feed; search results keep FB's order.
+    BOOL isSearch = [name containsString:@"Search"];
+    MPABCtx ctx = {0};
+    ctx.hideSeen = !isSearch && MPABPref(@"MPABHideSeen", MPAB_HIDE_SEEN);
+    ctx.markSeen = ctx.hideSeen && MPABPref(@"MPABSeenOnImpression", MPAB_SEEN_ON_IMPRESSION);
+    ctx.sortNewest = !isSearch && MPABPref(@"MPABSortNewest", MPAB_SORT_NEWEST);
+    ctx.maxAgeSec = isSearch ? 0 : MAX(0, MPABPrefNum(@"MPABMaxAgeHours", MPAB_MAX_AGE_HOURS)) * 3600.0;
+
     NSString *sep = [body containsString:@"\r\n"] ? @"\r\n" : @"\n";
     NSArray<NSString *> *parts = [body componentsSeparatedByString:sep];
     NSMutableArray<NSString *> *out = [NSMutableArray arrayWithCapacity:parts.count];
     NSMutableSet<NSString *> *seen = MPAB_LOG_ALL ? [NSMutableSet set] : nil;
-    NSUInteger removed = 0;
 
     for (NSString *part in parts) {
         NSString *trimmed = [part stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
@@ -197,21 +417,24 @@ static NSData *MPABFilterResponse(NSData *data, NSString *name) {
         id json = [NSJSONSerialization JSONObjectWithData:[trimmed dataUsingEncoding:NSUTF8StringEncoding]
                                                   options:NSJSONReadingMutableContainers error:nil];
         if (!json) return data; // multipart or something unexpected: leave untouched
-        NSUInteger n = MPABStrip(json, seen);
-        if (n == 0) { [out addObject:part]; continue; }
+        NSUInteger before = MPABCtxChanges(&ctx);
+        MPABStrip(json, seen, &ctx);
+        if (MPABCtxChanges(&ctx) == before) { [out addObject:part]; continue; }
         NSData *re = [NSJSONSerialization dataWithJSONObject:json options:0 error:nil];
         if (!re) return data;
         [out addObject:[[NSString alloc] initWithData:re encoding:NSUTF8StringEncoding]];
-        removed += n;
     }
 
 #if MPAB_LOG_ALL
-    os_log(MPABLog(), "%{public}@: %lu bytes, %lu parts, item types %{public}@",
+    os_log(MPABLog(), "%{public}@: %lu bytes, %lu parts, item types %{public}@, listings %lu (%lu with a time)",
            name, (unsigned long)data.length, (unsigned long)parts.count,
-           [seen.allObjects componentsJoinedByString:@","]);
+           [seen.allObjects componentsJoinedByString:@","],
+           (unsigned long)ctx.listings, (unsigned long)ctx.timed);
 #endif
-    if (removed == 0) return data;
-    os_log(MPABLog(), "stripped %lu ad item(s) from %{public}@", (unsigned long)removed, name);
+    if (MPABCtxChanges(&ctx) == 0) return data;
+    os_log(MPABLog(), "%{public}@: stripped %lu ad(s), hid %lu seen + %lu old, moved %lu",
+           name, (unsigned long)ctx.ads, (unsigned long)ctx.seen,
+           (unsigned long)ctx.old, (unsigned long)ctx.reordered);
     return [[out componentsJoinedByString:sep] dataUsingEncoding:NSUTF8StringEncoding];
 }
 
@@ -282,6 +505,83 @@ static NSMutableSet *MPABLiveDelegates(void) {
 
 @end
 
+#pragma mark - Opened listings
+
+// Listing detail queries (MarketplacePDP...Query) carry the listing id in their
+// variables. Opening a listing always counts as seen, whatever the seen mode.
+static BOOL MPABIsListingOpenName(NSString *name) {
+    static NSRegularExpression *re;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        re = [NSRegularExpression regularExpressionWithPattern:@"^MarketplacePDP\\w*Query$" options:0 error:nil];
+    });
+    return name.length && [re firstMatchInString:name options:0 range:NSMakeRange(0, name.length)] != nil;
+}
+
+static void MPABNoteOpenedListing(NSURLRequest *request) {
+    NSDictionary *vars = MPABRequestVariables(request);
+    if (!vars) return;
+    for (NSString *key in @[@"targetId", @"listingId", @"listing_id", @"productId", @"id"]) {
+        id v = vars[key];
+        NSString *lid = [v isKindOfClass:[NSString class]] ? v : ([v isKindOfClass:[NSNumber class]] ? [v stringValue] : nil);
+        if (lid.length) { MPABMarkSeen(lid); return; }
+    }
+}
+
+#pragma mark - Default to the Local tab
+
+static UIView *MPABFindTab(UIView *root, NSString *label, int depth) {
+    if (depth > 80) return nil;
+    NSString *l = root.accessibilityLabel;
+    if (l.length && !root.hidden && root.alpha > 0.01 &&
+        ([l caseInsensitiveCompare:label] == NSOrderedSame ||
+         [l.lowercaseString hasPrefix:[label.lowercaseString stringByAppendingString:@","]])) return root;
+    for (UIView *sub in root.subviews) {
+        UIView *f = MPABFindTab(sub, label, depth + 1);
+        if (f) return f;
+    }
+    return nil;
+}
+
+static void MPABTryLocalTab(NSUInteger attempt) {
+    if (attempt > 20) {
+        os_log(MPABLog(), "Local tab not found, giving up");
+        return;
+    }
+    NSString *label = [NSUserDefaults.standardUserDefaults stringForKey:@"MPABLocalTabLabel"];
+    if (label.length == 0) label = @MPAB_LOCAL_TAB_LABEL;
+
+    for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+        if (![scene isKindOfClass:[UIWindowScene class]]) continue;
+        for (UIWindow *window in ((UIWindowScene *)scene).windows) {
+            UIView *tab = MPABFindTab(window, label, 0);
+            if (!tab) continue;
+            if (tab.accessibilityTraits & UIAccessibilityTraitSelected) return; // already there
+            BOOL ok = [tab accessibilityActivate];
+            os_log(MPABLog(), "activated %{public}@ tab: %d", label, ok);
+            if (ok) return;
+        }
+    }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        MPABTryLocalTab(attempt + 1);
+    });
+}
+
+// Called for each Marketplace home feed query. The first page of a visit is
+// the cue that Marketplace just opened; pagination and our own tab switch are
+// throttled out so we never fight the user's manual tab choice mid-scroll.
+static void MPABMaybeSelectLocalTab(NSString *name) {
+    if (!MPABPref(@"MPABDefaultLocalTab", MPAB_DEFAULT_LOCAL_TAB)) return;
+    if (![name hasPrefix:@"MarketplaceHomeFeed"] || [name containsString:@"Pagination"]) return;
+    static CFAbsoluteTime last;
+    @synchronized ([MPABBlockingHandler class]) {
+        CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+        if (now - last < 20) return;
+        last = now;
+    }
+    dispatch_async(dispatch_get_main_queue(), ^{ MPABTryLocalTab(0); });
+}
+
 #pragma mark - Hook
 
 static IMP orig_handlerForRequest;
@@ -289,12 +589,20 @@ static IMP orig_handlerForRequest;
 static id hook_handlerForRequest(id self, SEL _cmd, NSURLRequest *request) {
     NSString *name = MPABFriendlyName(request);
 #if MPAB_LOG_ALL
-    if (name) os_log(MPABLog(), "query %{public}@", name);
+    if (name) {
+        NSDictionary *vars = [name hasPrefix:@"Marketplace"] ? MPABRequestVariables(request) : nil;
+        NSData *vd = vars ? [NSJSONSerialization dataWithJSONObject:vars options:0 error:nil] : nil;
+        NSString *vs = vd ? [[NSString alloc] initWithData:vd encoding:NSUTF8StringEncoding] : @"";
+        os_log(MPABLog(), "query %{public}@ vars %{public}@", name,
+               vs.length > 800 ? [vs substringToIndex:800] : vs);
+    }
 #endif
     if (MPABIsBlockedName(name)) {
         os_log(MPABLog(), "blocked %{public}@", name);
         return [MPABBlockingHandler shared];
     }
+    if (MPABIsListingOpenName(name)) MPABNoteOpenedListing(request);
+    MPABMaybeSelectLocalTab(name);
     id handler = ((id (*)(id, SEL, NSURLRequest *))orig_handlerForRequest)(self, _cmd, request);
     if (handler && MPABIsFilteredName(name)) {
         MPABFilteringHandler *wrapper = [MPABFilteringHandler new];
