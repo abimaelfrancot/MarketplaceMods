@@ -1,0 +1,10 @@
+Package: com.adamsardo.marketplaceadblock
+Name: MarketplaceAdBlock
+Version: @VERSION@
+Architecture: @ARCH@
+Description: Removes ads from Facebook Marketplace (home feed, search results, and listing-page related ads).
+Author: adamsardo
+Maintainer: Liam <schwi485@umn.edu>
+Homepage: https://github.com/adamsardo/MarketplaceAdBlock
+Section: Tweaks
+Depends: mobilesubstrate
